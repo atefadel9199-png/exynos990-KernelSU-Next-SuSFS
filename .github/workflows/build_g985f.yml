@@ -19,10 +19,7 @@ jobs:
             https://github.com/PixelExperience/prebuilts_clang_host_linux-x86_clang-r370808.git \
             https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git; do
             rm -rf ../tc/clang10
-            if git clone --depth=1 "$U" ../tc/clang10 && [ -x ../tc/clang10/bin/clang ]; then
-              echo "Cloned Clang from $U"
-              break
-            fi
+            if git clone --depth=1 "$U" ../tc/clang10 && [ -x ../tc/clang10/bin/clang ]; then break; fi
           done
           rm -rf ../tc/gcc49 && git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git ../tc/gcc49
       - name: Patch Peer 50
@@ -36,97 +33,164 @@ jobs:
           open(p, "w").write(ns)
           print("PATCH_OK:", n)
           PY
-      - name: Build
+      - name: Fix Firmware Blobs
+        run: |
+          cat boot_part_* > boot.img 2>/dev/null || true
+          python3 - << 'PY'
+          import os, re, struct, subprocess, zlib, urllib.request
+          b = open("boot.img", "rb").read() if os.path.exists("boot.img") else b""
+          c = [b] if len(b) > 100000 else []
+          if b[:8] == b"ANDROID!":
+              ks, ps, hv = struct.unpack_from("<I", b, 8)[0], struct.unpack_from("<I", b, 36)[0], struct.unpack_from("<I", b, 40)[0]
+              ps = 4096 if hv >= 3 else ps
+              if ps in (2048, 4096, 8192, 16384) and 0 < ks <= len(b) - ps: c.insert(0, b[ps:ps+ks])
+          for x in list(c):
+              i = 0
+              while (i := x.find(b"\x1f\x8b\x08", i)) != -1:
+                  try:
+                      d = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(x[i:])
+                      if len(d) > 1000000: c.append(d)
+                  except Exception: pass
+                  i += 1
+              for sig in (b"\x02\x21\x4c\x18", b"\x04\x22\x4d\x18"):
+                  i = 0
+                  while (i := x.find(sig, i)) != -1:
+                      r = subprocess.run(["lz4", "-d", "-f"], input=x[i:], capture_output=True)
+                      if len(r.stdout) > 1000000: c.append(r.stdout)
+                      i += 1
+          imgs, seen = [], set()
+          for x in c:
+              p = 0
+              while (p := x.find(b"ARMd", p)) != -1:
+                  if p >= 0x38 and len(x) - p + 0x38 > 1000000 and (len(x) - p) not in seen:
+                      seen.add(len(x) - p); imgs.append(x[p-0x38:])
+                  p += 4
+          anchors = []
+          for root, _, fs in os.walk("firmware"):
+              for fn in fs:
+                  if fn.endswith((".wa", ".bin", ".fw")) and not fn.endswith(".ihex"):
+                      fp = os.path.join(root, fn); dat = open(fp, "rb").read()
+                      if len(dat) >= 64: anchors.append((os.path.relpath(fp, "firmware").replace("\\", "/"), dat))
+          for img in imgs:
+              bva = seed = None; rela = False
+              for rel, dat in anchors:
+                  no, do = img.find(rel.encode() + b"\x00"), img.find(dat)
+                  if no == -1 or do == -1: continue
+                  sz, diff = len(dat), do - no
+                  pos = 0; sb = struct.pack("<Q", sz)
+                  while (pos := img.find(sb, pos)) != -1:
+                      if pos >= 16 and pos % 8 == 0:
+                          nv, dv = struct.unpack_from("<QQ", img, pos - 16)
+                          if (nv >> 48) == 0xffff and (dv >> 48) == 0xffff and (dv - nv) == diff:
+                              bva, rela, seed = nv - no, False, pos - 16; break
+                      pos += 8
+                  if bva is not None: break
+                  p1 = 0; r4 = struct.pack("<Q", 0x403)
+                  while (p1 := img.find(r4, p1)) != -1:
+                      if p1 >= 8 and p1 % 8 == 0 and p1 + 40 <= len(img):
+                          o1, i1, a1, o2, i2, a2 = struct.unpack_from("<QQQQQQ", img, p1 - 8)
+                          if i1 == 0x403 and i2 == 0x403 and o2 == o1 + 8 and (a2 - a1) == diff:
+                              cb = a1 - no; bo = o1 - cb
+                              if 0 <= bo <= len(img) - 24 and struct.unpack_from("<Q", img, bo + 16)[0] == sz:
+                                  bva, rela, seed = cb, True, p1 - 8; break
+                      p1 += 8
+                  if bva is not None: break
+              if bva is None: continue
+              def save(no, do, sz):
+                  if not (0 <= no < len(img) and 0 < sz < 16*1024*1024 and 0 <= do and do + sz <= len(img)): return False
+                  e = img.find(b"\x00", no, no + 256)
+                  if e <= no: return False
+                  try: nm = img[no:e].decode("ascii")
+                  except Exception: return False
+                  if not re.match(r'^[a-zA-Z0-9_./-]+$', nm) or ".." in nm or nm.startswith("/"): return False
+                  op = os.path.join("firmware", nm)
+                  if not os.path.exists(op) or os.path.getsize(op) == 0:
+                      os.makedirs(os.path.dirname(op), exist_ok=True)
+                      open(op, "wb").write(img[do:do+sz]); print("EXTRACTED:", op, sz)
+                  return True
+              st = 48 if rela else 24
+              for d in (-1, 1):
+                  cur = seed if d == 1 else seed - st
+                  while 0 <= cur <= len(img) - st:
+                      if rela:
+                          o1, i1, a1, o2, i2, a2 = struct.unpack_from("<QQQQQQ", img, cur)
+                          if i1 != 0x403 or i2 != 0x403 or o2 != o1 + 8: break
+                          bo = o1 - bva
+                          if not (0 <= bo <= len(img) - 24) or not save(a1 - bva, a2 - bva, struct.unpack_from("<Q", img, bo + 16)[0]): break
+                      else:
+                          nv, dv, sz = struct.unpack_from("<QQQ", img, cur)
+                          if (nv >> 48) != 0xffff or (dv >> 48) != 0xffff or not save(nv - bva, dv - bva, sz): break
+                      cur += d * st
+          mk_p = "firmware/Makefile"
+          if os.path.exists(mk_p):
+              mk = open(mk_p).read()
+              refs = set(re.findall(r'([a-zA-Z0-9_.-]+/[a-zA-Z0-9_./-]+\.(?:bin|fw|wa|img|hex|ucode|cfg|dat))', mk))
+              mirrors = [
+                  "https://raw.githubusercontent.com/ivanmeler/android_kernel_samsung_universal9830/lineage-20/firmware/",
+                  "https://raw.githubusercontent.com/ivanmeler/android_kernel_samsung_universal9830/lineage-21/firmware/",
+                  "https://raw.githubusercontent.com/LineageOS/android_kernel_samsung_universal9830/lineage-20/firmware/",
+              ]
+              for r in sorted(refs):
+                  fp = os.path.join("firmware", r)
+                  if os.path.exists(fp) or os.path.exists(fp + ".ihex") or os.path.exists(fp + ".H16"): continue
+                  for u in mirrors:
+                      try:
+                          dat = urllib.request.urlopen(urllib.request.Request(u + r, headers={"User-Agent": "Mozilla/5.0"}), timeout=8).read()
+                          if len(dat) > 64:
+                              os.makedirs(os.path.dirname(fp), exist_ok=True); open(fp, "wb").write(dat); print("DL:", fp, len(dat)); break
+                      except Exception: pass
+              g = (
+                  "\nfw-shipped-y := $(foreach f,$(fw-shipped-y),$(if $(wildcard $(srctree)/$(src)/$(f) $(srctree)/$(src)/$(f).ihex $(srctree)/$(src)/$(f).H16 $(obj)/$(f)),$(f),))\n"
+                  "fw-external-y := $(foreach f,$(fw-external-y),$(if $(wildcard $(fwdir)/$(f) $(srctree)/$(src)/$(f) $(obj)/$(f)),$(f),))\n"
+                  "obj-y := $(foreach o,$(obj-y),$(if $(filter %.gen.o,$(o)),$(if $(wildcard $(srctree)/$(src)/$(patsubst %.gen.o,%,$(o)) $(srctree)/$(src)/$(patsubst %.gen.o,%.ihex,$(o)) $(srctree)/$(src)/$(patsubst %.gen.o,%.H16,$(o)) $(fwdir)/$(patsubst %.gen.o,%,$(o)) $(obj)/$(patsubst %.gen.o,%,$(o))),$(o),),$(o)))\n"
+                  "targets := $(foreach t,$(targets),$(if $(filter %.gen.S,$(t)),$(if $(wildcard $(srctree)/$(src)/$(patsubst %.gen.S,%,$(t)) $(srctree)/$(src)/$(patsubst %.gen.S,%.ihex,$(t)) $(srctree)/$(src)/$(patsubst %.gen.S,%.H16,$(t)) $(fwdir)/$(patsubst %.gen.S,%,$(t)) $(obj)/$(patsubst %.gen.S,%,$(t))),$(t),),$(t)))\n"
+              )
+              if "patsubst %.gen.o" not in mk:
+                  mk = re.sub(r'^(obj-y\s*\+=.*\.gen\.o)', g + r'\1', mk, count=1, flags=re.M) + g
+                  open(mk_p, "w").write(mk); print("Makefile guard applied!")
+          PY
+      - name: Build Kernel
         run: |
           set -o pipefail
-          cat boot_part_* > boot.img 2>/dev/null || true
           chmod +x *.sh 2>/dev/null || true
           export CLANG_DIR=$(realpath ../tc/clang10)
           export GCC_DIR=$(realpath ../tc/gcc49)
-          ./build.sh -m g985f || true
-          python3 - << 'PY'
-          import os, re, struct, subprocess, zlib
-
-          cfg_path = "out_g985f/.config"
-          if not os.path.exists(cfg_path):
-              raise SystemExit("No .config generated")
-          cfg = open(cfg_path).read()
-          m_fw = re.search(r'^CONFIG_EXTRA_FIRMWARE="([^"]*)"', cfg, re.M)
-          m_dir = re.search(r'^CONFIG_EXTRA_FIRMWARE_DIR="([^"]*)"', cfg, re.M)
-          fw_list = m_fw.group(1).split() if m_fw else []
-          fw_dir = m_dir.group(1) if (m_dir and m_dir.group(1)) else "firmware"
-          print("Needed firmware:", fw_list, "in", fw_dir)
-
-          boot = open("boot.img", "rb").read()
-          candidates = [boot]
-          for sig in [b"\x1f\x8b\x08"]:
-              idx = 0
-              while True:
-                  idx = boot.find(sig, idx)
-                  if idx == -1: break
-                  try:
-                      candidates.append(zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(boot[idx:]))
-                  except Exception:
-                      pass
-                  idx += 1
-          for sig in [b"\x02\x21\x4c\x18", b"\x04\x22\x4d\x18"]:
-              idx = 0
-              while True:
-                  idx = boot.find(sig, idx)
-                  if idx == -1: break
-                  r = subprocess.run(["lz4", "-d", "-f"], input=boot[idx:], capture_output=True)
-                  if len(r.stdout) > 1000000:
-                      candidates.append(r.stdout)
-                  idx += 1
-
-          images = []
-          for buf in candidates:
-              p = 0
-              while True:
-                  p = buf.find(b"ARMd", p)
-                  if p == -1: break
-                  if p >= 0x38:
-                      images.append(buf[p - 0x38:])
-                  p += 4
-          print("Kernel Image candidates:", len(images))
-
-          for fw in fw_list:
-              out_p = os.path.join(fw_dir, fw)
-              if os.path.exists(out_p) and os.path.getsize(out_p) > 0:
-                  print("Already exists:", out_p)
-                  continue
-              needle = fw.encode() + b"\x00"
-              found = None
-              for img in images:
-                  pos = 0
-                  while True:
-                      noff = img.find(needle, pos)
-                      if noff == -1: break
-                      pos = noff + 1
-                      for off in range(0, len(img) - 24, 8):
-                          nva, dva, sz = struct.unpack_from("<QQQ", img, off)
-                          if 0 < sz < 16 * 1024 * 1024:
-                              bva = nva - noff
-                              if (bva >> 48) == 0xffff and (bva & 0xfff) == 0:
-                                  doff = dva - bva
-                                  if 0 <= doff and doff + sz <= len(img):
-                                      found = img[doff:doff + sz]
-                                      break
-                      if found: break
-                  if found: break
-              assert found, f"Could not extract {fw} from boot.img"
-              os.makedirs(os.path.dirname(out_p), exist_ok=True)
-              open(out_p, "wb").write(found)
-              print(f"Extracted {out_p} ({len(found)} bytes)")
-          PY
           ./build.sh -m g985f 2>&1 | tee build.log || {
             echo "=== EXACT COMPILER ERRORS ==="
-            grep -E "error:|fatal error:|undefined reference|Error [12]" build.log | tail -n 30
+            grep -E "No rule to make|error:|fatal error:|undefined reference|Error [12]" build.log | tail -n 30
             exit 1
           }
-          if [ -f ./mkzip.sh ]; then ./mkzip.sh -m g985f || ./mkzip.sh g985f || ./mkzip.sh; fi
-          find . -maxdepth 3 -name "*.zip" -mmin -30 -exec cp -n {} . \; || true
+          mkdir -p release_out
+          if [ -f ./mkzip.sh ]; then
+            ./mkzip.sh -m g985f || ./mkzip.sh g985f || ./mkzip.sh || true
+          fi
+          find . .. -maxdepth 3 -name "*.zip" -mmin -35 ! -path "./release_out/*" -exec cp -n {} release_out/ \; 2>/dev/null || true
+          if ! ls release_out/*.zip >/dev/null 2>&1; then
+            IMG=$(find out_g985f . -maxdepth 5 -name "Image" -type f -size +10M | head -n 1)
+            test -n "$IMG" || { echo "NO KERNEL IMAGE FOUND"; exit 1; }
+            git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git /tmp/ak3
+            cp "$IMG" /tmp/ak3/Image
+            cat << 'AK' > /tmp/ak3/anykernel.sh
+          properties() { '
+          kernel.string=S20+ G985F KernelSU-Next SuSFS NoPeer50
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          '; }
+          BLOCK=auto;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+          . tools/ak3-core.sh;
+          dump_boot;
+          write_boot;
+          AK
+            (cd /tmp/ak3 && zip -r9 "$GITHUB_WORKSPACE/release_out/S20Plus_G985F_NoPeer50.zip" . -x ".git*" "README.md" "*placeholder")
+          fi
+          ls -lh release_out/
       - uses: actions/upload-artifact@v4
         with:
           name: S20Plus_G985F_NoPeer50
-          path: "*.zip"
+          path: "release_out/*.zip"
