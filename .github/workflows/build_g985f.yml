@@ -21,7 +21,6 @@ jobs:
             rm -rf ../tc/clang10
             if git clone --depth=1 "$U" ../tc/clang10 && [ -x ../tc/clang10/bin/clang ]; then
               echo "Cloned Clang from $U"
-              ../tc/clang10/bin/clang --version | head -n 2
               break
             fi
           done
@@ -44,6 +43,82 @@ jobs:
           chmod +x *.sh 2>/dev/null || true
           export CLANG_DIR=$(realpath ../tc/clang10)
           export GCC_DIR=$(realpath ../tc/gcc49)
+          ./build.sh -m g985f || true
+          python3 - << 'PY'
+          import os, re, struct, subprocess, zlib
+
+          cfg_path = "out_g985f/.config"
+          if not os.path.exists(cfg_path):
+              raise SystemExit("No .config generated")
+          cfg = open(cfg_path).read()
+          m_fw = re.search(r'^CONFIG_EXTRA_FIRMWARE="([^"]*)"', cfg, re.M)
+          m_dir = re.search(r'^CONFIG_EXTRA_FIRMWARE_DIR="([^"]*)"', cfg, re.M)
+          fw_list = m_fw.group(1).split() if m_fw else []
+          fw_dir = m_dir.group(1) if (m_dir and m_dir.group(1)) else "firmware"
+          print("Needed firmware:", fw_list, "in", fw_dir)
+
+          boot = open("boot.img", "rb").read()
+          candidates = [boot]
+          for sig in [b"\x1f\x8b\x08"]:
+              idx = 0
+              while True:
+                  idx = boot.find(sig, idx)
+                  if idx == -1: break
+                  try:
+                      candidates.append(zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(boot[idx:]))
+                  except Exception:
+                      pass
+                  idx += 1
+          for sig in [b"\x02\x21\x4c\x18", b"\x04\x22\x4d\x18"]:
+              idx = 0
+              while True:
+                  idx = boot.find(sig, idx)
+                  if idx == -1: break
+                  r = subprocess.run(["lz4", "-d", "-f"], input=boot[idx:], capture_output=True)
+                  if len(r.stdout) > 1000000:
+                      candidates.append(r.stdout)
+                  idx += 1
+
+          images = []
+          for buf in candidates:
+              p = 0
+              while True:
+                  p = buf.find(b"ARMd", p)
+                  if p == -1: break
+                  if p >= 0x38:
+                      images.append(buf[p - 0x38:])
+                  p += 4
+          print("Kernel Image candidates:", len(images))
+
+          for fw in fw_list:
+              out_p = os.path.join(fw_dir, fw)
+              if os.path.exists(out_p) and os.path.getsize(out_p) > 0:
+                  print("Already exists:", out_p)
+                  continue
+              needle = fw.encode() + b"\x00"
+              found = None
+              for img in images:
+                  pos = 0
+                  while True:
+                      noff = img.find(needle, pos)
+                      if noff == -1: break
+                      pos = noff + 1
+                      for off in range(0, len(img) - 24, 8):
+                          nva, dva, sz = struct.unpack_from("<QQQ", img, off)
+                          if 0 < sz < 16 * 1024 * 1024:
+                              bva = nva - noff
+                              if (bva >> 48) == 0xffff and (bva & 0xfff) == 0:
+                                  doff = dva - bva
+                                  if 0 <= doff and doff + sz <= len(img):
+                                      found = img[doff:doff + sz]
+                                      break
+                      if found: break
+                  if found: break
+              assert found, f"Could not extract {fw} from boot.img"
+              os.makedirs(os.path.dirname(out_p), exist_ok=True)
+              open(out_p, "wb").write(found)
+              print(f"Extracted {out_p} ({len(found)} bytes)")
+          PY
           ./build.sh -m g985f 2>&1 | tee build.log || {
             echo "=== EXACT COMPILER ERRORS ==="
             grep -E "error:|fatal error:|undefined reference|Error [12]" build.log | tail -n 30
