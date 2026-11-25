@@ -12,25 +12,17 @@ uses: actions/checkout@v4
   - name: Install Tools
     run: |
       sudo apt-get update
-      sudo apt-get install -y bc bison flex zip lz4
-      sudo apt-get install -y libssl-dev libelf-dev
-      sudo apt-get install -y python3 cpio curl git
+      sudo apt-get install -y bc bison flex zip lz4 libssl-dev libelf-dev python3 cpio curl git
 
   - name: Download Clang 10
     run: |
       mkdir -p ../tc/clang10 ../tc/gcc49
-      URL="https://android.googlesource.com/platform"
-      URL="$URL/prebuilts/clang/host/linux-x86"
-      URL="$URL/+archive/refs/tags/android-10.0.0_r47"
-      URL="$URL/clang-r370808.tar.gz"
+      URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-10.0.0_r47/clang-r370808.tar.gz"
       curl -sL "$URL" | tar -xz -C ../tc/clang10
 
   - name: Download GCC 4.9
     run: |
-      GCC_REPO="https://github.com/LineageOS"
-      GCC_REPO="$GCC_REPO/android_prebuilts_gcc_linux-x86"
-      GCC_REPO="${GCC_REPO}_aarch64"
-      GCC_REPO="${GCC_REPO}_aarch64-linux-android-4.9.git"
+      GCC_REPO="https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git"
       git clone --depth=1 "$GCC_REPO" ../tc/gcc49
 
   - name: Hide Peer ID 50 Patch
@@ -47,7 +39,8 @@ uses: actions/checkout@v4
 
   - name: Extract Blobs
     run: |
-      cat boot_part_* > boot.img && python3 tools/s20/extract_firmware.py boot.img
+      cat boot_part_* > boot.img
+      python3 tools/s20/extract_firmware.py boot.img
 
   - name: Build Kernel
     run: |
