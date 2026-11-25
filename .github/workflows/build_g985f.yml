@@ -12,7 +12,19 @@ jobs:
         run: |
           export GIT_TERMINAL_PROMPT=0
           mkdir -p ../tc
-          (rm -rf ../tc/clang10 && git clone --depth=1 https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r370808.git ../tc/clang10) || (rm -rf ../tc/clang10 && git clone --depth=1 https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git ../tc/clang10) || (rm -rf ../tc/clang10 && git clone --depth=1 https://github.com/kdrag0n/proton-clang.git ../tc/clang10)
+          for U in \
+            https://github.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r370808.git \
+            https://github.com/ArrowOS/android_prebuilts_clang_host_linux-x86_clang-r370808.git \
+            https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r370808.git \
+            https://github.com/PixelExperience/prebuilts_clang_host_linux-x86_clang-r370808.git \
+            https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git; do
+            rm -rf ../tc/clang10
+            if git clone --depth=1 "$U" ../tc/clang10 && [ -x ../tc/clang10/bin/clang ]; then
+              echo "Cloned Clang from $U"
+              ../tc/clang10/bin/clang --version | head -n 2
+              break
+            fi
+          done
           rm -rf ../tc/gcc49 && git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git ../tc/gcc49
       - name: Patch Peer 50
         run: |
@@ -27,16 +39,18 @@ jobs:
           PY
       - name: Build
         run: |
-          cat boot_part_* > boot.img
-          EXT=$(find . -maxdepth 4 \( -iname "*extract*firmware*.py" -o -iname "*extract*boot*.py" \) | head -n 1)
-          if [ -n "$EXT" ]; then echo "Running $EXT"; python3 "$EXT" boot.img || true; fi
+          set -o pipefail
+          cat boot_part_* > boot.img 2>/dev/null || true
           chmod +x *.sh 2>/dev/null || true
           export CLANG_DIR=$(realpath ../tc/clang10)
           export GCC_DIR=$(realpath ../tc/gcc49)
-          export MODEL=g985f
-          ./build.sh -m g985f || ./build.sh g985f || { head -n 45 build.sh; exit 1; }
+          ./build.sh -m g985f 2>&1 | tee build.log || {
+            echo "=== EXACT COMPILER ERRORS ==="
+            grep -E "error:|fatal error:|undefined reference|Error [12]" build.log | tail -n 30
+            exit 1
+          }
           if [ -f ./mkzip.sh ]; then ./mkzip.sh -m g985f || ./mkzip.sh g985f || ./mkzip.sh; fi
-          find . -maxdepth 3 -name "*.zip" -mmin -20 -exec cp -n {} . \; || true
+          find . -maxdepth 3 -name "*.zip" -mmin -30 -exec cp -n {} . \; || true
       - uses: actions/upload-artifact@v4
         with:
           name: S20Plus_G985F_NoPeer50
