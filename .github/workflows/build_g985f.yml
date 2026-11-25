@@ -1,56 +1,50 @@
 name: Build S20+ G985F Hide Peer 50
 on:
-workflow_dispatch:
+  workflow_dispatch:
 
 jobs:
-build:
-runs-on: ubuntu-22.04
-steps:
-- name: Checkout Source
-uses: actions/checkout@v4
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
 
-  - name: Install Tools
-    run: |
-      sudo apt-get update
-      sudo apt-get install -y bc bison flex zip lz4 libssl-dev libelf-dev python3 cpio curl git
+      - name: Install Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex zip lz4 libssl-dev libelf-dev python3 cpio curl git
 
-  - name: Download Clang 10
-    run: |
-      mkdir -p ../tc/clang10 ../tc/gcc49
-      URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-10.0.0_r47/clang-r370808.tar.gz"
-      curl -sL "$URL" | tar -xz -C ../tc/clang10
+      - name: Download Clang 10
+        run: |
+          mkdir -p ../tc/clang10 ../tc/gcc49
+          curl -sL https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-10.0.0_r47/clang-r370808.tar.gz | tar -xz -C ../tc/clang10
 
-  - name: Download GCC 4.9
-    run: |
-      GCC_REPO="https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git"
-      git clone --depth=1 "$GCC_REPO" ../tc/gcc49
+      - name: Download GCC 4.9
+        run: |
+          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git ../tc/gcc49
 
-  - name: Hide Peer ID 50 Patch
-    run: |
-      python3 -c '
-      p = "fs/proc_namespace.c"
-      code = open(p).read()
-      old = "seq_printf(m, \" shared:%i\", mnt->mnt_group_id);"
-      new = "if (mnt->mnt_group_id < 50) " + old
-      assert old in code, "TARGET NOT FOUND"
-      open(p, "w").write(code.replace(old, new))
-      print("PATCH APPLIED SUCCESSFULLY")
-      '
+      - name: Hide Peer ID 50 Patch
+        run: |
+          PY="p=\"fs/proc_namespace.c\"; code=open(p).read(); "
+          PY+="old=\"seq_printf(m, \\\" shared:%i\\\", mnt->mnt_group_id);\"; "
+          PY+="new=\"if (mnt->mnt_group_id < 50) \"+old; "
+          PY+="assert old in code; open(p,\"w\").write(code.replace(old,new)); print(\"PATCH_OK\")"
+          python3 -c "$PY"
 
-  - name: Extract Blobs
-    run: |
-      cat boot_part_* > boot.img
-      python3 tools/s20/extract_firmware.py boot.img
+      - name: Extract Blobs
+        run: |
+          cat boot_part_* > boot.img
+          python3 tools/s20/extract_firmware.py boot.img
 
-  - name: Build Kernel
-    run: |
-      export CLANG_DIR=$(realpath ../tc/clang10)
-      export GCC_DIR=$(realpath ../tc/gcc49)
-      ./build.sh -m g985f
-      ./mkzip.sh -m g985f
+      - name: Build Kernel
+        run: |
+          export CLANG_DIR=$(realpath ../tc/clang10)
+          export GCC_DIR=$(realpath ../tc/gcc49)
+          ./build.sh -m g985f
+          ./mkzip.sh -m g985f
 
-  - name: Upload Zip
-    uses: actions/upload-artifact@v4
-    with:
-      name: S20Plus_G985F_NoPeer50
-      path: "*.zip"
+      - name: Upload Zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: S20Plus_G985F_NoPeer50
+          path: "*.zip"
