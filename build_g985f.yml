@@ -1,0 +1,165 @@
+name: Build S20+ G985F Hide Peer 50
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: sudo apt-get update && sudo apt-get install -y bc bison flex zip lz4 libssl-dev libelf-dev python3 cpio curl git build-essential
+      - name: Toolchains
+        run: |
+          export GIT_TERMINAL_PROMPT=0
+          mkdir -p ../tc
+          for U in \
+            https://github.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r370808.git \
+            https://github.com/ArrowOS/android_prebuilts_clang_host_linux-x86_clang-r370808.git \
+            https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r370808.git \
+            https://github.com/PixelExperience/prebuilts_clang_host_linux-x86_clang-r370808.git \
+            https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git; do
+            rm -rf ../tc/clang10
+            if git clone --depth=1 "$U" ../tc/clang10 && [ -x ../tc/clang10/bin/clang ]; then
+              echo "Cloned Clang from $U"; break
+            fi
+          done
+          rm -rf ../tc/gcc49 && git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git ../tc/gcc49
+      - name: Patch Peer 50
+        run: |
+          python3 - << 'PY'
+          import re
+          p = "fs/proc_namespace.c"
+          s = open(p).read()
+          ns, n = re.subn(r'(seq_printf\s*\(\s*m\s*,\s*" shared:%[id]"\s*,\s*([^;]+?)\s*\);)', r'{ if ((\2) < 50) \1 }', s)
+          assert n > 0, "TARGET_NOT_FOUND"
+          open(p, "w").write(ns)
+          print("PATCH_OK:", n)
+          PY
+      - name: Extract Firmware from boot.img
+        run: |
+          cat boot_part_* > boot.img
+          python3 - << 'PY'
+          import os, re, struct, subprocess, zlib
+          b = open("boot.img", "rb").read()
+          c = [b]
+          if b[:8] == b"ANDROID!":
+              ks, ps, hv = struct.unpack_from("<I", b, 8)[0], struct.unpack_from("<I", b, 36)[0], struct.unpack_from("<I", b, 40)[0]
+              ps = 4096 if hv >= 3 else ps
+              if ps in (2048, 4096, 8192, 16384) and 0 < ks <= len(b) - ps: c.insert(0, b[ps:ps+ks])
+          for x in list(c):
+              i = 0
+              while (i := x.find(b"\x1f\x8b\x08", i)) != -1:
+                  try:
+                      d = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(x[i:])
+                      if len(d) > 1000000: c.append(d)
+                  except Exception: pass
+                  i += 1
+              for sig in (b"\x02\x21\x4c\x18", b"\x04\x22\x4d\x18"):
+                  i = 0
+                  while (i := x.find(sig, i)) != -1:
+                      r = subprocess.run(["lz4", "-d", "-f"], input=x[i:], capture_output=True)
+                      if len(r.stdout) > 1000000: c.append(r.stdout)
+                      i += 1
+          imgs, sl = [], set()
+          for x in c:
+              p = 0
+              while (p := x.find(b"ARMd", p)) != -1:
+                  if p >= 0x38 and len(x) - p + 0x38 > 1000000 and (len(x) - p) not in sl:
+                      sl.add(len(x) - p); imgs.append(x[p-0x38:])
+                  p += 4
+          print("Images:", [len(x) for x in imgs])
+          fre = re.compile(rb'(?<=\x00)([a-zA-Z0-9_./-]+\.(?:bin|fw|wa|img|hex|ucode|cfg|dat))\x00')
+          tot = 0
+          for img in imgs:
+              ms = [(m.group(1).decode(), m.start(1)) for m in fre.finditer(img)]
+              pri = sorted(ms, key=lambda x: (0 if any(k in x[0] for k in ("y771","tsp_","valhall","abov","mfc","npu")) else (1 if "/" in x[0] else 2), len(x[0])))
+              bva = seed = None; rela = False
+              for nm, no in pri[:150]:
+                  pat = re.compile(re.escape(struct.pack("<H", no & 0xffff)) + rb'....\xff\xff', re.S)
+                  for hm in pat.finditer(img):
+                      pos = hm.start()
+                      if pos % 8: continue
+                      cb = struct.unpack_from("<Q", img, pos)[0] - no
+                      if cb & 0xffff: continue
+                      if 16 <= pos <= len(img) - 32:
+                          o1, i1, a1 = struct.unpack_from("<QQQ", img, pos - 16)
+                          o2, i2, a2 = struct.unpack_from("<QQQ", img, pos + 8)
+                          if i1 == 0x403 and i2 == 0x403 and o2 == o1 + 8:
+                              bo, do = o1 - cb, a2 - cb
+                              if 0 <= bo <= len(img) - 24:
+                                  sz = struct.unpack_from("<Q", img, bo + 16)[0]
+                                  if 0 < sz < 16*1024*1024 and 0 <= do and do + sz <= len(img):
+                                      bva, rela, seed = cb, True, pos - 16; break
+                      if pos <= len(img) - 24:
+                          nv, dv, sz = struct.unpack_from("<QQQ", img, pos)
+                          pq = struct.unpack_from("<Q", img, pos - 8)[0] if pos >= 8 else 0
+                          if pq == 0x403 and sz == 0x403: continue
+                          do = dv - cb
+                          if 0 < sz < 16*1024*1024 and 0 <= do and do + sz <= len(img) and (dv >> 48) == 0xffff:
+                              bva, rela, seed = cb, False, pos; break
+                  if bva is not None: break
+              if bva is None: continue
+              print("Found builtin_fw:", hex(bva), "rela=", rela)
+              found = {}
+              def add(no, do, sz):
+                  if not (0 <= no < len(img) and 0 < sz < 16*1024*1024 and 0 <= do and do + sz <= len(img)): return False
+                  e = img.find(b"\x00", no, no + 256)
+                  if e <= no: return False
+                  try: nm = img[no:e].decode("ascii")
+                  except Exception: return False
+                  if not re.match(r'^[a-zA-Z0-9_./-]+$', nm) or ".." in nm or nm.startswith("/"): return False
+                  found[nm] = img[do:do+sz]; return True
+              st = 48 if rela else 24
+              for d in (-1, 1):
+                  cur = seed if d == 1 else seed - st
+                  while 0 <= cur <= len(img) - st:
+                      if rela:
+                          o1, i1, a1 = struct.unpack_from("<QQQ", img, cur)
+                          o2, i2, a2 = struct.unpack_from("<QQQ", img, cur + 24)
+                          if i1 != 0x403 or i2 != 0x403 or o2 != o1 + 8: break
+                          bo = o1 - bva
+                          if not (0 <= bo <= len(img) - 24) or not add(a1 - bva, a2 - bva, struct.unpack_from("<Q", img, bo + 16)[0]): break
+                      else:
+                          nv, dv, sz = struct.unpack_from("<QQQ", img, cur)
+                          if (nv >> 48) != 0xffff or (dv >> 48) != 0xffff or not add(nv - bva, dv - bva, sz): break
+                      cur += d * st
+              for nm, no in ms:
+                  if nm in found: continue
+                  nd, pos = struct.pack("<Q", bva + no), 0
+                  while (pos := img.find(nd, pos)) != -1:
+                      if pos % 8 == 0:
+                          if rela and 16 <= pos <= len(img) - 32:
+                              o1, i1, a1 = struct.unpack_from("<QQQ", img, pos - 16)
+                              o2, i2, a2 = struct.unpack_from("<QQQ", img, pos + 8)
+                              if i1 == 0x403 and i2 == 0x403 and o2 == o1 + 8 and 0 <= o1 - bva <= len(img) - 24:
+                                  if add(no, a2 - bva, struct.unpack_from("<Q", img, o1 - bva + 16)[0]): break
+                          elif not rela and pos <= len(img) - 24:
+                              nv, dv, sz = struct.unpack_from("<QQQ", img, pos)
+                              if (dv >> 48) == 0xffff and add(no, dv - bva, sz): break
+                      pos += 1
+              for nm, dat in sorted(found.items()):
+                  op = os.path.join("firmware", nm)
+                  if not os.path.exists(op) or os.path.getsize(op) == 0:
+                      os.makedirs(os.path.dirname(op), exist_ok=True)
+                      open(op, "wb").write(dat)
+                      print("EXTRACTED:", op, len(dat)); tot += 1
+          print("Total extracted:", tot)
+          PY
+          ls -la firmware/tsp_sec/ 2>/dev/null || true
+      - name: Build Kernel
+        run: |
+          set -o pipefail
+          chmod +x *.sh 2>/dev/null || true
+          export CLANG_DIR=$(realpath ../tc/clang10)
+          export GCC_DIR=$(realpath ../tc/gcc49)
+          ./build.sh -m g985f 2>&1 | tee build.log || {
+            echo "=== EXACT COMPILER ERRORS ==="
+            grep -E "No rule to make|error:|fatal error:|undefined reference|Error [12]" build.log | tail -n 30
+            exit 1
+          }
+          if [ -f ./mkzip.sh ]; then ./mkzip.sh -m g985f || ./mkzip.sh g985f || ./mkzip.sh; fi
+          find . -maxdepth 3 -name "*.zip" -mmin -30 -exec cp -n {} . \; || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: S20Plus_G985F_NoPeer50
+          path: "*.zip"
