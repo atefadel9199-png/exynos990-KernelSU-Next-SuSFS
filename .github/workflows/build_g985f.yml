@@ -1,68 +1,40 @@
 name: Build S20+ G985F Hide Peer 50
 on:
-workflow_dispatch:
-
+  workflow_dispatch:
 jobs:
-build:
-runs-on: ubuntu-22.04
-steps:
-- name: Checkout Source
-uses: actions/checkout@v4
-
-  - name: Install Tools
-    run: |
-      sudo apt-get update
-      sudo apt-get install -y bc bison flex zip lz4
-      sudo apt-get install -y libssl-dev libelf-dev
-      sudo apt-get install -y python3 cpio curl git
-
-  - name: Download Clang
-    run: |
-      mkdir -p ../tc/clang10 ../tc/gcc49
-      C1="https://github.com/crdroidandroid"
-      C1="$C1/android_prebuilts_clang_host_linux-x86"
-      C1="${C1}_clang-r370808.git"
-      C2="https://github.com/kdrag0n/proton-clang.git"
-      git clone --depth=1 "$C1" ../tc/clang10 || \
-      git clone --depth=1 "$C2" ../tc/clang10
-
-  - name: Download GCC 4.9
-    run: |
-      G1="https://github.com/LineageOS"
-      G1="$G1/android_prebuilts_gcc_linux-x86"
-      G1="${G1}_aarch64"
-      G1="${G1}_aarch64-linux-android-4.9.git"
-      git clone --depth=1 "$G1" ../tc/gcc49
-
-  - name: Hide Peer ID 50 Patch
-    run: |
-      python3 -c '
-      import re
-      p = "fs/proc_namespace.c"
-      s = open(p).read()
-      pat = r"(seq_printf\s*\(\s*m\s*,"
-      pat += r"\s*\" shared:%[id]\"[^;]+;)"
-      rep = r"if (mnt->mnt_group_id < 50) \1"
-      ns, n = re.subn(pat, rep, s)
-      assert n > 0, "TARGET_NOT_FOUND"
-      open(p, "w").write(ns)
-      print("PATCH_APPLIED:", n)
-      '
-
-  - name: Extract Blobs
-    run: |
-      cat boot_part_* > boot.img
-      python3 tools/s20/extract_firmware.py boot.img
-
-  - name: Build Kernel
-    run: |
-      export CLANG_DIR=$(realpath ../tc/clang10)
-      export GCC_DIR=$(realpath ../tc/gcc49)
-      ./build.sh -m g985f
-      ./mkzip.sh -m g985f
-
-  - name: Upload Zip
-    uses: actions/upload-artifact@v4
-    with:
-      name: S20Plus_G985F_NoPeer50
-      path: "*.zip"
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: sudo apt-get update && sudo apt-get install -y bc bison flex zip lz4 libssl-dev libelf-dev python3 cpio curl git build-essential
+      - name: Toolchains
+        run: |
+          export GIT_TERMINAL_PROMPT=0
+          mkdir -p ../tc
+          (rm -rf ../tc/clang10 && git clone --depth=1 https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r370808.git ../tc/clang10) || (rm -rf ../tc/clang10 && git clone --depth=1 https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git ../tc/clang10) || (rm -rf ../tc/clang10 && git clone --depth=1 https://github.com/kdrag0n/proton-clang.git ../tc/clang10)
+          rm -rf ../tc/gcc49 && git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git ../tc/gcc49
+      - name: Patch Peer 50
+        run: |
+          python3 - << 'PY'
+          import re
+          p = "fs/proc_namespace.c"
+          s = open(p).read()
+          ns, n = re.subn(r'(seq_printf\s*\(\s*m\s*,\s*" shared:%[id]"\s*,\s*([^;]+?)\s*\);)', r'{ if ((\2) < 50) \1 }', s)
+          assert n > 0, "TARGET_NOT_FOUND"
+          open(p, "w").write(ns)
+          print("PATCH_OK:", n)
+          PY
+      - name: Build
+        run: |
+          cat boot_part_* > boot.img
+          python3 tools/s20/extract_firmware.py boot.img
+          export CLANG_DIR=$(realpath ../tc/clang10)
+          export GCC_DIR=$(realpath ../tc/gcc49)
+          ./build.sh -m g985f
+          ./mkzip.sh -m g985f
+          find . -maxdepth 3 -name "*.zip" -mmin -15 -exec cp -n {} . \; || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: S20Plus_G985F_NoPeer50
+          path: "*.zip"
